@@ -122,14 +122,14 @@ to solve the problem:
 		rsync -e '/path/to/ssh-ident' ...
 		scp -S '/path/to/ssh-ident' ...
 
-4) Replace the real ssh on the system with ssh-ident, and set the 
+4) Replace the real ssh on the system with ssh-ident, and set the
 	 BINARY_SSH configuration parameter to the original value.
 
 	 On Debian based system, you can make this change in a way that
 	 will survive automated upgrades and audits by running:
 
 		 dpkg-divert --divert /usr/bin/ssh.ssh-ident --rename /usr/bin/ssh
-	 
+
 	 After which, you will need to use:
 
 		 BINARY_SSH="/usr/bin/ssh.ssh-ident"
@@ -177,10 +177,10 @@ To have multiple identities, all I have to do is:
 	SSH_ADD_OPTIONS = {
 		# Regardless, ask for confirmation before using any of the
 		# work keys.
-		"work": "-c",
+		"work": ["-c"],
 		# Forget about secret keys after ten minutes. ssh-ident will
 		# automatically ask you your passphrase again if they are needed.
-		"secret": "-t 600",
+		"secret": ["-t", "600"],
 	}
 
 	# This is option - dont' include any SSH_OPTIONS if you don't
@@ -190,21 +190,21 @@ To have multiple identities, all I have to do is:
 	"SSH_OPTIONS": {
 		# Disable forwarding of the agent, but enable X forwarding,
 		# when using the work profile.
-		"work": "-Xa",
+		"work": ["-Xa"],
 
 		# Always forward the agent when using the secret identity.
-		"secret": "-A"
+		"secret": ["-A"]
 	},
 
 	# Options to pass to ssh by default.
 	# If you don't specify anything, UserRoaming=no is passed, due
 	# to CVE-2016-0777. Leave it empty to disable this.
-	"SSH_DEFAULT_OPTIONS": "-oUseRoaming=no",
+	"SSH_DEFAULT_OPTIONS": ["-oUseRoaming=no"],
 
 	# Which options to use by default if no match with SSH_ADD_OPTIONS
 	# was found. Note that ssh-ident hard codes -t 7200 to prevent your
 	# keys from remaining in memory for too long.
-	SSH_ADD_DEFAULT_OPTIONS = "-t 7200"
+	SSH_ADD_DEFAULT_OPTIONS = ["-t", "7200"]
 
 	# Output verbosity
 	# valid values are: LOG_ERROR, LOG_WARN, LOG_INFO, LOG_DEBUG
@@ -417,7 +417,7 @@ class Config(object):
 			# the specified options to the ssh command run.
 			"SSH_OPTIONS": {},
 			# Additional options to append to ssh by default.
-			"SSH_DEFAULT_OPTIONS": "-oUseRoaming=no",
+			"SSH_DEFAULT_OPTIONS": ["-oUseRoaming=no"],
 
 			# Complete path of full ssh binary to use. If not set, ssh-ident will
 			# try to find the correct binary in PATH.
@@ -438,7 +438,7 @@ class Config(object):
 			"SSH_ADD_OPTIONS": {},
 			# ssh-add default options. By default, don't keep a key longer
 			# than 2 hours.
-			"SSH_ADD_DEFAULT_OPTIONS": "-t 7200",
+			"SSH_ADD_DEFAULT_OPTIONS": ["-t", "7200"],
 
 			# Like BatchMode in ssh, see man 5 ssh_config.
 			# In BatchMode ssh-ident will not print any output and not ask for
@@ -653,7 +653,7 @@ class AgentManager(object):
 					file=sys.stderr, loglevel=LOG_INFO)
 			self.LoadKeyFiles(toload)
 		else:
-			print("All keys already loaded", file=sys.stderr, loglevel=LOG_INFO)
+			print("All keys already loaded", file=sys.stderr, loglevel=LOG_DEBUG)
 
 	def FindUnloadedKeys(self, keys):
 		"""Determines which keys have not been loaded yet.
@@ -685,40 +685,38 @@ class AgentManager(object):
 		Args:
 			keys: iterable of strings, each string a path to a key to load.
 		"""
-		keys = " ".join(keys)
 		options = self.config.Get("SSH_ADD_OPTIONS").get(
 				self.identity, self.config.Get("SSH_ADD_DEFAULT_OPTIONS"))
-		self.RunShellCommandInAgent(
-				self.agent_file, "ssh-add {0} {1}".format(options, keys))
+		try:
+			self.RunShellCommandInAgent(self.agent_file, ["ssh-add"] + options + list(keys), disable_io=True)
+		except subprocess.CalledProcessError:
+			print("Error occurs during keys loading, exiting...", file=sys.stderr)
+			exit(-1)
 
 	def GetLoadedKeys(self):
 		"""Returns an iterable of strings, each the fingerprint of a loaded key."""
-		retval, stdout = self.RunShellCommandInAgent(self.agent_file, "ssh-add -l")
-		if retval != 0:
+		try:
+			stdout = self.RunShellCommandInAgent(self.agent_file, ["ssh-add", "-l"])
+			fingerprints = []
+			for line in stdout.decode("utf-8").split("\n"):
+				try:
+					_, fingerprint, _ = line.split(" ", 2)
+					fingerprints.append(fingerprint)
+				except ValueError:
+					continue
+			return fingerprints
+		except subprocess.CalledProcessError:
 			return []
-
-		fingerprints = []
-		for line in stdout.decode("utf-8").split("\n"):
-			try:
-				_, fingerprint, _ = line.split(" ", 2)
-				fingerprints.append(fingerprint)
-			except ValueError:
-				continue
-		return fingerprints
 
 	@staticmethod
 	def GetPublicKeyFingerprint(key):
 		"""Returns the fingerprint of a public key as a string."""
-		retval, stdout = AgentManager.RunShellCommand(
-				"ssh-keygen -l -f {0} |tr -s ' '".format(key))
-		if retval:
-			return None
-
 		try:
+			stdout = AgentManager.RunShellCommand(["ssh-keygen", "-l", "-f", key])
 			_, fingerprint, _ = stdout.decode("utf-8").split(" ", 2)
-		except ValueError:
+			return fingerprint
+		except subprocess.CalledProcessError, ValueError:
 			return None
-		return fingerprint
 
 	@staticmethod
 	def GetAgentFile(path, identity):
@@ -750,66 +748,73 @@ class AgentManager(object):
 
 		print("Preparing new agent for identity {0}".format(identity), file=sys.stderr,
 				loglevel=LOG_DEBUG)
-		retval = subprocess.call(
-				["/usr/bin/env", "-i", "/bin/sh", "-c", "ssh-agent > {0}".format(agentfile)])
+		agentenv = AgentManager.RunShellCommand(["ssh-agent"])
+		with open(agentfile, 'w') as env:
+			env.write(agentenv)
 		return agentfile
 
 	@staticmethod
 	def IsAgentFileValid(agentfile):
 		"""Returns true if the specified agentfile refers to a running agent."""
-		retval, output = AgentManager.RunShellCommandInAgent(
-				agentfile, "ssh-add -l >/dev/null 2>/dev/null")
-		if retval & 0xff not in [0, 1]:
-			print("Agent in {0} not running".format(agentfile), file=sys.stderr,
-					loglevel=LOG_DEBUG)
+		try:
+			AgentManager.RunShellCommandInAgent(agentfile, ["ssh-add", "-l"])
+			return True
+		except subprocess.CalledProcessError:
 			return False
-		return True
 
 	@staticmethod
-	def RunShellCommand(command):
-		"""Runs a shell command, returns (status, stdout), (int, string)."""
-		command = ["/bin/sh", "-c", command]
-		process = subprocess.Popen(command, stdout=subprocess.PIPE)
-		stdout, stderr = process.communicate()
-		return process.wait(), stdout
+	def RunShellCommand(command, disable_io=False, **kwargs):
+		"""Runs a shell command, returns (stdout), (string)."""
+		for io in ["stdin", "stdout", "stderr"]:
+			kwargs[io] = subprocess.PIPE
+		if disable_io:
+			kwargs["preexec_fn"] = os.setsid
+			subprocess.check_call(command, **kwargs)
+			return None
+		else:
+			process = subprocess.Popen(command, **kwargs)
+			stdout, stderr = process.communicate()
+			retr = process.returncode
+			if retr != 0:
+				raise subprocess.CalledProcessError(retr, command, stderr)
+			return stdout
+		return stdout
 
 	@staticmethod
-	def RunShellCommandInAgent(agentfile, command):
+	def GetAgentEnv(agentfile):
+		env = {}
+		with open(agentfile, 'r') as agentenv:
+			for line in agentenv:
+				line = line.split(";")[0]
+				line = line.split("=")
+				if len(line) == 2:
+					name, value = line
+					env[name] = value
+		for e in ["TERM"]:
+			if e in os.environ:
+				env[e] = os.environ[e]
+		return env
+
+	@staticmethod
+	def RunShellCommandInAgent(agentfile, command, disable_io=False, **kwargs):
 		"""Runs a shell command with an agent configured in the environment."""
-		command = ["/bin/sh", "-c",
-							 ". {0} >/dev/null 2>/dev/null; {1}".format(agentfile, command)]
-		process = subprocess.Popen(command, stdout=subprocess.PIPE)
-		stdout, stderr = process.communicate()
-		return process.wait(), stdout
-
-	@staticmethod
-	def EscapeShellArguments(argv):
-		"""Escapes all arguments to the shell, returns a string."""
-		escaped = []
-		for arg in argv:
-			escaped.append("'{0}'".format(arg.replace("'", "'\"'\"'")))
-		return " ".join(escaped)
-
-	def GetShellArgs(self):
-		"""Returns the flags to be passed to the shell to run a command."""
-		shell_args = "-c"
-		if ShouldPrint(self.config, LOG_DEBUG):
-			shell_args = "-xc"
-		return shell_args
+		env = AgentManager.GetAgentEnv(agentfile)
+		for e in ["SSH_ASKPASS", "DISPLAY", "XDG_CURRENT_DESKTOP", "KDE_SESSION_VERSION", "HOME"]:
+			if e in os.environ:
+				env[e] = os.environ[e]
+		kwargs["env"] = env
+		return AgentManager.RunShellCommand(command, disable_io=disable_io, **kwargs)
 
 	def RunSSH(self, argv):
 		"""Execs ssh with the specified arguments."""
 		additional_flags = self.config.Get("SSH_OPTIONS").get(
 				self.identity, self.config.Get("SSH_DEFAULT_OPTIONS"))
 		if (self.ssh_config):
-			additional_flags += " -F {0}".format(self.ssh_config)
-
-		command = [
-				"/bin/sh", self.GetShellArgs(),
-				". {0} >/dev/null 2>/dev/null; exec {1} {2} {3}".format(
-						self.agent_file, self.config.Get("BINARY_SSH"),
-						additional_flags, self.EscapeShellArguments(argv))]
-		os.execv("/bin/sh", command)
+			additional_flags += ["-F"] + self.ssh_config
+		env = AgentManager.GetAgentEnv(self.agent_file)
+		cmd = self.config.Get("BINARY_SSH")
+		args = additional_flags + argv
+		os.execve(cmd, args, env)
 
 def AutodetectBinary(argv, config):
 	"""Detects the correct binary to run and sets BINARY_SSH accordingly,
@@ -845,7 +850,7 @@ def AutodetectBinary(argv, config):
 	# The logic here is pretty straightforward:
 	# - Try to eliminate the path of ssh-ident from PATH.
 	# - Search for a binary with the same name of ssh-ident to run.
-	# 
+	#
 	# If this fails, we may end up in some sort of loop, where ssh-ident
 	# tries to run itself. This should normally be detected later on,
 	# where the code checks for the next binary to run.
@@ -897,7 +902,7 @@ def AutodetectBinary(argv, config):
 		ssh-ident was invoked in place of the binary {0} (determined from argv[0]).
 		Neither this binary nor 'ssh' could be found in $PATH.
 
-			PATH="{1}" 
+			PATH="{1}"
 
 		You need to adjust your setup for ssh-ident to work: consider setting
 		BINARY_SSH or BINARY_DIR in your config, or running ssh-ident some
@@ -931,11 +936,6 @@ def ParseCommandLine(argv, config):
 				break
 
 def main(argv):
-	# Replace stdout and stderr with /dev/tty, so we don't mess up with scripts
-	# that use ssh in case we error out or similar.
-	sys.stdout = open("/dev/tty", "w")
-	sys.stderr = open("/dev/tty", "w")
-
 	config = Config().Load()
 	# overwrite python's print function with the wrapper SshIdentPrint
 	global print
@@ -956,8 +956,8 @@ def main(argv):
 		message = textwrap.dedent("""\
 		ssh-ident found '{0}' as the next command to run.
 		Based on argv[0] ({1}), it seems like this will create a
-		loop. 
-		
+		loop.
+
 		Please use BINARY_SSH, BINARY_DIR, or change the way
 		ssh-ident is invoked (eg, a different argv[0]) to make
 		it work correctly.""")
